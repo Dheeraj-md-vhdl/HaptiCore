@@ -1,0 +1,386 @@
+"""
+ML Training Code for Vehicle Horn Classification
+Run this on your PC/Laptop to train the model
+Requirements: pip install numpy scikit-learn tensorflow librosa
+"""
+
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import librosa
+import json
+import glob
+import os
+
+# ==================== FEATURE EXTRACTION ====================
+
+class AudioFeatureExtractor:
+    """Extract features from audio files for ML training"""
+    
+    def __init__(self, sample_rate=16000, duration=1.0):
+        self.sample_rate = sample_rate
+        self.duration = duration
+        self.n_mfcc = 13
+        
+    def extract_features(self, audio_file):
+        """
+        Extract MFCC and other audio features
+        Returns: numpy array of features
+        """
+        try:
+            # Load audio file
+            audio, sr = librosa.load(audio_file, sr=self.sample_rate, duration=self.duration)
+            
+            # Pad if too short
+            if len(audio) < self.sample_rate * self.duration:
+                audio = np.pad(audio, (0, int(self.sample_rate * self.duration) - len(audio)))
+            
+            # Extract MFCCs (Mel-frequency cepstral coefficients)
+            mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=self.n_mfcc)
+            mfccs_mean = np.mean(mfccs, axis=1)
+            mfccs_std = np.std(mfccs, axis=1)
+            
+            # Spectral features
+            spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr))
+            spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=audio, sr=sr))
+            spectral_bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr))
+            
+            # Temporal features
+            zero_crossing = np.mean(librosa.feature.zero_crossing_rate(audio))
+            rms_energy = np.mean(librosa.feature.rms(y=audio))
+            
+            # Combine all features
+            features = np.concatenate([
+                mfccs_mean,
+                mfccs_std,
+                [spectral_centroid, spectral_rolloff, spectral_bandwidth,
+                 zero_crossing, rms_energy]
+            ])
+            
+            return features
+            
+        except Exception as e:
+            print(f"Error extracting features from {audio_file}: {e}")
+            return None
+    
+    def process_dataset(self, audio_files, labels):
+        """Process multiple audio files"""
+        features_list = []
+        labels_list = []
+        
+        print(f"Processing {len(audio_files)} audio files...")
+        
+        for i, (audio_file, label) in enumerate(zip(audio_files, labels)):
+            if i % 10 == 0:
+                print(f"Processed {i}/{len(audio_files)} files")
+            
+            features = self.extract_features(audio_file)
+            if features is not None:
+                features_list.append(features)
+                labels_list.append(label)
+        
+        print(f"Successfully processed {len(features_list)} files")
+        
+        X = np.array(features_list)
+        y = np.array(labels_list)
+        
+        return X, y
+
+# ==================== MODEL TRAINING ====================
+
+class HornClassifierModel:
+    """Build and train neural network for horn classification"""
+    
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.class_names = ['Background', 'Car Horn', 'Bike Horn', 'Truck Horn']
+        
+    def build_model(self, input_shape, num_classes):
+        """
+        Build lightweight neural network optimized for TFLite
+        """
+        model = keras.Sequential([
+            layers.Input(shape=(input_shape,)),
+            
+            # First hidden layer
+            layers.Dense(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.4),
+            
+            # Second hidden layer
+            layers.Dense(32, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            
+            # Third hidden layer
+            layers.Dense(16, activation='relu'),
+            layers.Dropout(0.2),
+            
+            # Output layer
+            layers.Dense(num_classes, activation='softmax')
+        ])
+        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def train(self, X, y, epochs=100, batch_size=16, validation_split=0.2):
+        """Train the model"""
+        print("\n" + "="*60)
+        print("TRAINING HORN CLASSIFICATION MODEL")
+        print("="*60)
+        
+        # Split dataset
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        print(f"\nDataset split:")
+        print(f"Training samples: {len(X_train)}")
+        print(f"Testing samples: {len(X_test)}")
+        
+        # Normalize features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Build model
+        num_classes = len(np.unique(y))
+        self.model = self.build_model(X_train_scaled.shape[1], num_classes)
+        
+        print("\nModel Architecture:")
+        self.model.summary()
+        
+        # Callbacks
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True
+        )
+        
+        reduce_lr = keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=0.00001
+        )
+        
+        # Train
+        print("\nStarting training...")
+        history = self.model.fit(
+            X_train_scaled, y_train,
+            validation_split=validation_split,
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[early_stopping, reduce_lr],
+            verbose=1
+        )
+        
+        # Evaluate
+        print("\n" + "="*60)
+        test_loss, test_acc = self.model.evaluate(X_test_scaled, y_test, verbose=0)
+        print(f"Test Accuracy: {test_acc*100:.2f}%")
+        print(f"Test Loss: {test_loss:.4f}")
+        print("="*60)
+        
+        # Per-class accuracy
+        y_pred = np.argmax(self.model.predict(X_test_scaled), axis=1)
+        for i in range(num_classes):
+            class_mask = y_test == i
+            if np.sum(class_mask) > 0:
+                class_acc = np.mean(y_pred[class_mask] == y_test[class_mask])
+                print(f"{self.class_names[i]}: {class_acc*100:.2f}%")
+        
+        return history
+    
+    def convert_to_tflite(self, output_path='horn_model.tflite'):
+        """Convert model to TensorFlow Lite for ESP32"""
+        print("\n" + "="*60)
+        print("CONVERTING TO TENSORFLOW LITE")
+        print("="*60)
+        
+        # Convert model
+        converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
+        
+        # Optimize for microcontroller
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float32]
+        
+        # Enable experimental features for smaller size
+        converter.experimental_new_converter = True
+        
+        tflite_model = converter.convert()
+        
+        # Save model
+        with open(output_path, 'wb') as f:
+            f.write(tflite_model)
+        
+        print(f"\n✓ TFLite model saved: {output_path}")
+        print(f"✓ Model size: {len(tflite_model)/1024:.2f} KB")
+        
+        # Save scaler parameters for ESP32
+        scaler_params = {
+            'mean': self.scaler.mean_.tolist(),
+            'scale': self.scaler.scale_.tolist(),
+            'feature_count': len(self.scaler.mean_)
+        }
+        
+        scaler_path = 'scaler_params.json'
+        with open(scaler_path, 'w') as f:
+            json.dump(scaler_params, f, indent=2)
+        
+        print(f"✓ Scaler parameters saved: {scaler_path}")
+        print("="*60)
+        
+        return tflite_model
+    
+    def save_model_info(self, output_path='model_info.txt'):
+        """Save model information"""
+        with open(output_path, 'w') as f:
+            f.write("Horn Classification Model Information\n")
+            f.write("="*60 + "\n\n")
+            f.write("Classes:\n")
+            for i, name in enumerate(self.class_names):
+                f.write(f"  {i}: {name}\n")
+            f.write(f"\nInput features: {len(self.scaler.mean_)}\n")
+            f.write(f"Output classes: {len(self.class_names)}\n")
+        
+        print(f"✓ Model info saved: {output_path}")
+
+# ==================== MAIN TRAINING SCRIPT ====================
+
+def main():
+    """
+    Main training pipeline
+    
+    Dataset structure should be:
+    dataset/
+        car_horn/
+            sample1.wav
+            sample2.wav
+            ...
+        bike_horn/
+            sample1.wav
+            sample2.wav
+            ...
+        truck_horn/
+            sample1.wav
+            sample2.wav
+            ...
+        background/
+            sample1.wav
+            sample2.wav
+            ...
+    """
+    
+    print("="*60)
+    print("VEHICLE HORN CLASSIFICATION - ML TRAINING")
+    print("="*60)
+    
+    # Define dataset path
+    dataset_path = 'dataset'  # Change this to your dataset folder
+    
+    # Check if dataset exists
+    if not os.path.exists(dataset_path):
+        print(f"\n❌ Error: Dataset folder '{dataset_path}' not found!")
+        print("\nPlease organize your audio files as follows:")
+        print("dataset/")
+        print("  ├── car_horn/      (car horn sound files)")
+        print("  ├── bike_horn/     (bike horn sound files)")
+        print("  ├── truck_horn/    (truck horn sound files)")
+        print("  └── background/    (background noise files)")
+        return
+    
+    # Load dataset
+    print(f"\nLoading dataset from: {dataset_path}")
+    
+    car_horns = glob.glob(os.path.join(dataset_path, 'car_horn', '*.wav'))
+    bike_horns = glob.glob(os.path.join(dataset_path, 'bike_horn', '*.wav'))
+    truck_horns = glob.glob(os.path.join(dataset_path, 'truck_horn', '*.wav'))
+    background = glob.glob(os.path.join(dataset_path, 'background', '*.wav'))
+    
+    print(f"\nDataset summary:")
+    print(f"  Car horns: {len(car_horns)} files")
+    print(f"  Bike horns: {len(bike_horns)} files")
+    print(f"  Truck horns: {len(truck_horns)} files")
+    print(f"  Background: {len(background)} files")
+    print(f"  Total: {len(car_horns) + len(bike_horns) + len(truck_horns) + len(background)} files")
+    
+    if len(car_horns) + len(bike_horns) + len(truck_horns) + len(background) == 0:
+        print("\n❌ Error: No audio files found in dataset folders!")
+        return
+    
+    # Prepare labels (0: background, 1: car, 2: bike, 3: truck)
+    audio_files = background + car_horns + bike_horns + truck_horns
+    labels = ([0]*len(background) + [1]*len(car_horns) + 
+              [2]*len(bike_horns) + [3]*len(truck_horns))
+    
+    # Extract features
+    print("\n" + "="*60)
+    print("FEATURE EXTRACTION")
+    print("="*60)
+    extractor = AudioFeatureExtractor(sample_rate=16000, duration=1.0)
+    X, y = extractor.process_dataset(audio_files, labels)
+    
+    if len(X) == 0:
+        print("\n❌ Error: No features extracted!")
+        return
+    
+    print(f"\nFeature shape: {X.shape}")
+    print(f"Labels shape: {y.shape}")
+    
+    # Train model
+    classifier = HornClassifierModel()
+    history = classifier.train(X, y, epochs=100, batch_size=16)
+    
+    # Convert to TFLite
+    classifier.convert_to_tflite('horn_model.tflite')
+    classifier.save_model_info('model_info.txt')
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
+    print("\nGenerated files:")
+    print("  1. horn_model.tflite     - Model for ESP32")
+    print("  2. scaler_params.json    - Feature normalization parameters")
+    print("  3. model_info.txt        - Model information")
+    print("\nNext step: Upload these files to ESP32 and flash the ESP32 code")
+    print("="*60)
+
+# ==================== EXAMPLE: DATASET CREATION HELPER ====================
+
+def create_sample_dataset_structure():
+    """Helper function to create dataset folder structure"""
+    folders = [
+        'dataset/car_horn',
+        'dataset/bike_horn',
+        'dataset/truck_horn',
+        'dataset/background'
+    ]
+    
+    for folder in folders:
+        os.makedirs(folder, exist_ok=True)
+    
+    print("Created dataset folder structure:")
+    print("dataset/")
+    print("  ├── car_horn/")
+    print("  ├── bike_horn/")
+    print("  ├── truck_horn/")
+    print("  └── background/")
+    print("\nNow add your .wav audio files to these folders!")
+
+# ==================== RUN ====================
+
+if __name__ == '__main__':
+    # Uncomment the next line to create dataset folders
+    # create_sample_dataset_structure()
+    
+    # Run training
+    main()
